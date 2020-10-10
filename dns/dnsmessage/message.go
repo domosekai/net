@@ -1,6 +1,7 @@
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+// Modified by domosekai 2020
 
 // Package dnsmessage provides a mostly RFC 1035 compliant implementation of
 // DNS message packing and unpacking.
@@ -33,6 +34,8 @@ const (
 	TypeAAAA  Type = 28
 	TypeSRV   Type = 33
 	TypeOPT   Type = 41
+	TypeSVCB  Type = 64
+	TypeHTTPS Type = 65
 
 	// Question.Type
 	TypeWKS   Type = 11
@@ -53,6 +56,8 @@ var typeNames = map[Type]string{
 	TypeAAAA:  "TypeAAAA",
 	TypeSRV:   "TypeSRV",
 	TypeOPT:   "TypeOPT",
+	TypeSVCB:  "TypeSVCB",
+	TypeHTTPS: "TypeHTTPS",
 	TypeWKS:   "TypeWKS",
 	TypeHINFO: "TypeHINFO",
 	TypeMINFO: "TypeMINFO",
@@ -158,6 +163,45 @@ func (r RCode) GoString() string {
 		return "dnsmessage." + n
 	}
 	return printUint16(uint16(r))
+}
+
+// A SVCBKey is a type of SVCB parameter key.
+type SVCBKey uint16
+
+const (
+	KeyMandatory     SVCBKey = 0
+	KeyALPN          SVCBKey = 1
+	KeyNoDefaultALPN SVCBKey = 2
+	KeyPort          SVCBKey = 3
+	KeyIPv4Hint      SVCBKey = 4
+	KeyECHConfig     SVCBKey = 5
+	KeyIPv6Hint      SVCBKey = 6
+)
+
+var keyNames = map[SVCBKey]string{
+	KeyMandatory:     "KeyMandatory",
+	KeyALPN:          "KeyALPN",
+	KeyNoDefaultALPN: "KeyNoDefaultALPN",
+	KeyPort:          "KeyPort",
+	KeyIPv4Hint:      "KeyIPv4Hint",
+	KeyECHConfig:     "KeyECHConfig",
+	KeyIPv6Hint:      "KeyIPv6Hint",
+}
+
+// String implements fmt.Stringer.String.
+func (k SVCBKey) String() string {
+	if n, ok := keyNames[k]; ok {
+		return n
+	}
+	return printUint16(uint16(k))
+}
+
+// GoString implements fmt.GoStringer.GoString.
+func (k SVCBKey) GoString() string {
+	if n, ok := keyNames[k]; ok {
+		return "dnsmessage." + n
+	}
+	return printUint16(uint16(k))
 }
 
 func printPaddedUint8(i uint8) string {
@@ -1041,6 +1085,24 @@ func (p *Parser) UnknownResource() (UnknownResource, error) {
 	return r, nil
 }
 
+// HTTPSResource parses a single HTTPSResource.
+//
+// One of the XXXHeader methods must have been called before calling this
+// method.
+func (p *Parser) HTTPSResource() (HTTPSResource, error) {
+	if !p.resHeaderValid || p.resHeader.Type != TypeHTTPS {
+		return HTTPSResource{}, ErrNotStarted
+	}
+	r, err := unpackHTTPSResource(p.msg, p.off, p.resHeader.Length)
+	if err != nil {
+		return HTTPSResource{}, err
+	}
+	p.off += int(p.resHeader.Length)
+	p.resHeaderValid = false
+	p.index++
+	return r, nil
+}
+
 // Unpack parses a full Message.
 func (m *Message) Unpack(msg []byte) error {
 	var p Parser
@@ -1588,6 +1650,30 @@ func (b *Builder) UnknownResource(h ResourceHeader, r UnknownResource) error {
 	preLen := len(msg)
 	if msg, err = r.pack(msg, b.compression, b.start); err != nil {
 		return &nestedError{"UnknownResource body", err}
+	}
+	if err := h.fixLen(msg, lenOff, preLen); err != nil {
+		return err
+	}
+	if err := b.incrementSectionCount(); err != nil {
+		return err
+	}
+	b.msg = msg
+	return nil
+}
+
+// HTTPSResource adds a single HTTPSResource.
+func (b *Builder) HTTPSResource(h ResourceHeader, r HTTPSResource) error {
+	if err := b.checkResourceSection(); err != nil {
+		return err
+	}
+	h.Type = r.realType()
+	msg, lenOff, err := h.pack(b.msg, b.compression, b.start)
+	if err != nil {
+		return &nestedError{"ResourceHeader", err}
+	}
+	preLen := len(msg)
+	if msg, err = r.pack(msg, b.compression, b.start); err != nil {
+		return &nestedError{"HTTPSResource body", err}
 	}
 	if err := h.fixLen(msg, lenOff, preLen); err != nil {
 		return err
@@ -2177,6 +2263,11 @@ func unpackResourceBody(msg []byte, off int, hdr ResourceHeader) (ResourceBody, 
 		rb, err = unpackOPTResource(msg, off, hdr.Length)
 		r = &rb
 		name = "OPT"
+	case TypeHTTPS:
+		var rb HTTPSResource
+		rb, err = unpackHTTPSResource(msg, off, hdr.Length)
+		r = &rb
+		name = "HTTPS"
 	default:
 		var rb UnknownResource
 		rb, err = unpackUnknownResource(hdr.Type, msg, off, hdr.Length)
@@ -2661,4 +2752,125 @@ func unpackUnknownResource(recordType Type, msg []byte, off int, length uint16) 
 		return UnknownResource{}, err
 	}
 	return parsed, nil
+}
+
+// An HTTPSResource is an HTTPS Resource record.
+type HTTPSResource struct {
+	Priority uint16
+	Target   Name
+	ALPN     []string
+	Port     uint16
+	IPv4Hint [][4]byte
+	IPv6Hint [][16]byte
+}
+
+func (r *HTTPSResource) realType() Type {
+	return TypeHTTPS
+}
+
+// pack appends the wire format of the HTTPSResource to msg.
+func (r *HTTPSResource) pack(msg []byte, compression map[string]int, compressionOff int) ([]byte, error) {
+	oldMsg := msg
+	for _, s := range r.ALPN {
+		var err error
+		msg, err = packText(msg, s)
+		if err != nil {
+			return oldMsg, err
+		}
+	}
+	return msg, nil
+}
+
+// GoString implements fmt.GoStringer.GoString.
+func (r *HTTPSResource) GoString() string {
+	s := "dnsmessage.HTTPSResource{HTTPS: []string{"
+	if len(r.ALPN) == 0 {
+		return s + "}}"
+	}
+	s += `"` + printString([]byte(r.ALPN[0]))
+	for _, t := range r.ALPN[1:] {
+		s += `", "` + printString([]byte(t))
+	}
+	return s + `"}}`
+}
+
+func unpackHTTPSResource(msg []byte, off int, length uint16) (HTTPSResource, error) {
+	oldOff := off
+	priority, off, err := unpackUint16(msg, off)
+	if err != nil {
+		return HTTPSResource{}, &nestedError{"Priority", err}
+	}
+	var target Name
+	off, err = target.unpackCompressed(msg, off, false)
+	if err != nil {
+		return HTTPSResource{}, &nestedError{"Target", err}
+	}
+	// In AliasMode, SvcParams is empty
+	if priority == 0 {
+		return HTTPSResource{Priority: priority, Target: target}, nil
+	}
+	var alpns []string
+	var port uint16
+	var ipv4Hint [][4]byte
+	var ipv6Hint [][16]byte
+	for off < oldOff+int(length) {
+		var err error
+		var k uint16
+		k, off, err = unpackUint16(msg, off)
+		if err != nil {
+			return HTTPSResource{}, &nestedError{"Key", err}
+		}
+		var l uint16
+		l, off, err = unpackUint16(msg, off)
+		if err != nil {
+			return HTTPSResource{}, &nestedError{"Length", err}
+		}
+		switch SVCBKey(k) {
+		case KeyALPN:
+			alpns = make([]string, 0, 5)
+			for n := uint16(0); n < l; {
+				var a string
+				var err error
+				if a, off, err = unpackText(msg, off); err != nil {
+					return HTTPSResource{}, &nestedError{"alpn", err}
+				}
+				// Check if we got too many bytes.
+				if l-n < uint16(len(a))+1 {
+					return HTTPSResource{}, errCalcLen
+				}
+				n += uint16(len(a)) + 1
+				alpns = append(alpns, a)
+			}
+		case KeyPort:
+			port, off, err = unpackUint16(msg, off)
+			if err != nil {
+				return HTTPSResource{}, &nestedError{"port", err}
+			}
+		case KeyIPv4Hint:
+			ipv4Hint = make([][4]byte, 0, 5)
+			for n := uint16(0); n < l; {
+				var ip [4]byte
+				var err error
+				if off, err = unpackBytes(msg, off, ip[:]); err != nil {
+					return HTTPSResource{}, &nestedError{"ipv4hint", err}
+				}
+				n += 4
+				ipv4Hint = append(ipv4Hint, ip)
+			}
+		case KeyIPv6Hint:
+			ipv6Hint = make([][16]byte, 0, 5)
+			for n := uint16(0); n < l; {
+				var ip [16]byte
+				var err error
+				if off, err = unpackBytes(msg, off, ip[:]); err != nil {
+					return HTTPSResource{}, &nestedError{"ipv6hint", err}
+				}
+				n += 16
+				ipv6Hint = append(ipv6Hint, ip)
+			}
+		default:
+			off += int(l)
+		}
+	}
+	return HTTPSResource{priority, target, alpns, port, ipv4Hint, ipv6Hint}, nil
 }
