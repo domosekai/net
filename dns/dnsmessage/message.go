@@ -316,6 +316,7 @@ var (
 	errNonCanonicalName   = errors.New("name is not in canonical format (it must end with a .)")
 	errStringTooLong      = errors.New("character string exceeds maximum length (255)")
 	errCompressedSRV      = errors.New("compressed name in SRV resource data")
+	errSvcParamInc        = errors.New("SvcParamKeys should be in strictly increasing order")
 )
 
 // Internal constants.
@@ -2813,6 +2814,7 @@ func unpackHTTPSResource(msg []byte, off int, length uint16) (HTTPSResource, err
 	var port uint16
 	var ipv4Hint [][4]byte
 	var ipv6Hint [][16]byte
+	lastKey := -1
 	for off < oldOff+int(length) {
 		var err error
 		var k uint16
@@ -2820,6 +2822,10 @@ func unpackHTTPSResource(msg []byte, off int, length uint16) (HTTPSResource, err
 		if err != nil {
 			return HTTPSResource{}, &nestedError{"Key", err}
 		}
+		if int(k) <= lastKey {
+			return HTTPSResource{}, &nestedError{"Key", errSvcParamInc}
+		}
+		lastKey = int(k)
 		var l uint16
 		l, off, err = unpackUint16(msg, off)
 		if err != nil {
